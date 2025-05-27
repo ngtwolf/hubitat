@@ -1,0 +1,841 @@
+/**
+ *  WiFi Presence Sensor with UniFi (v1 - Gemini Enhanced)
+ *
+ *  Based off original Iphone Presense Sensor script by Joel Wetzel
+ *  Significant modifications and enhancements by Gemini/AI (2025)
+ *
+ *  -----------------------------------------------------------------------------
+ *  Description:
+ *  This Hubitat Groovy device driver provides presence detection based on a
+ *  device's connection to the local WiFi network. It can operate in several modes:
+ *  1. HTTP Ping: Regularly attempts to connect to a specified IP address and port
+ *     on the target device.
+ *  2. UniFi Integration (Optional): If enabled, it queries a UniFi Network
+ *     Controller (UDM, Cloud Key, Self-Hosted) to check if a device with a
+ *     specific MAC address is connected to the UniFi wireless network.
+ *  3. Hybrid Modes: Combines HTTP ping and UniFi data for enhanced reliability,
+ *     allowing UniFi to be primary with HTTP fallback, or using both sources
+ *     simultaneously.
+ *
+ *  The driver aims to provide a more reliable presence status than simple ping
+ *  commands, especially by incorporating UniFi data, which can be particularly
+ *  useful for devices that may not respond to HTTP pings when asleep (e.g., iPhones).
+ *  It allows for configurable polling intervals based on whether the device is
+ *  currently present or away, and a configurable number of failed polls before
+ *  marking a device as not present. User-configurable settings also include
+ *  UniFi controller details, device type optimizations, and timeout values.
+ *  -----------------------------------------------------------------------------
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ *  in compliance with the License. You may obtain a copy of the License at:
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+ *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+ *  for the specific language governing permissions and limitations under the License.
+ *
+ */
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.text.SimpleDateFormat
+
+metadata {
+    definition (name: "WiFi Presence Sensor with UniFi", namespace: "", author: "Gemini") {
+        capability "Refresh"
+        capability "Sensor"
+        capability "Presence Sensor"
+
+        attribute "lastSeen", "STRING"
+        attribute "lastTried", "STRING"
+        attribute "failedPolls", "NUMBER"
+        attribute "nextCheckIn", "STRING"
+        attribute "deviceType", "STRING"
+        attribute "detectionMethod", "STRING"
+        attribute "unifiStatus", "STRING"
+        attribute "unifiLastSeen", "STRING"
+    }
+
+    preferences {
+        section("Device Settings") {
+            input (
+                type: "string",
+                name: "ipAddress",
+                title: "IP Address",
+                required: true
+            )
+            input (
+                type: "string",
+                name: "macAddress",
+                title: "MAC Address (for UniFi lookup)",
+                description: "Required for UniFi integration. Format: aa:bb:cc:dd:ee:ff",
+                required: false
+            )
+            input (
+                type: "number",
+                name: "targetPort",
+                title: "Target Port",
+                description: "The network port to check on the IP Address.",
+                required: true,
+                defaultValue: 80
+            )
+            input (
+                type: "enum",
+                name: "deviceType",
+                title: "Device Type",
+                description: "Select device type for optimized settings",
+                options: [
+                    "iphone": "iPhone/iOS Device",
+                    "android": "Android Device", 
+                    "computer": "Computer/Laptop",
+                    "other": "Other Device"
+                ],
+                required: true,
+                defaultValue: "other"
+            )
+        }
+        section("UniFi Integration (Optional)") {
+            input (
+                type: "bool",
+                name: "enableUnifiIntegration",
+                title: "Enable UniFi Integration?",
+                description: "Use UniFi Controller to check device connection status",
+                required: true,
+                defaultValue: false
+            )
+            input (
+                type: "string",
+                name: "unifiControllerIP",
+                title: "UniFi Controller IP",
+                description: "IP address of your UniFi Controller/Dream Machine",
+                required: false
+            )
+            input (
+                type: "string",
+                name: "unifiControllerPort",
+                title: "UniFi Controller Port",
+                description: "Port for UniFi Controller (default: 443 for UDM/Cloud Key, 8443 for self-hosted)",
+                required: false,
+                defaultValue: "443"
+            )
+            input (
+                type: "string",
+                name: "unifiUsername",
+                title: "UniFi Username",
+                description: "Username for UniFi Controller login",
+                required: false
+            )
+            input (
+                type: "password",
+                name: "unifiPassword",
+                title: "UniFi Password",
+                description: "Password for UniFi Controller login",
+                required: false
+            )
+            input (
+                type: "enum",
+                name: "unifiControllerType",
+                title: "UniFi Controller Type",
+                description: "Select your UniFi controller type for correct API endpoints",
+                options: [
+                    "udm": "Dream Machine (UDM/UDM Pro/SE)",
+                    "cloudkey": "Cloud Key (Gen1/Gen2)",
+                    "selfhosted": "Self-hosted Controller"
+                ],
+                required: false,
+                defaultValue: "udm"
+            )
+            input (
+                type: "string",
+                name: "unifiSite",
+                title: "UniFi Site Name",
+                description: "UniFi site name (default: 'default')",
+                required: false,
+                defaultValue: "default"
+            )
+        }
+        section("Detection & Timing Settings") {
+            input (
+                type: "enum",
+                name: "detectionMode",
+                title: "Detection Mode",
+                description: "How to combine HTTP ping and UniFi data",
+                options: [
+                    "hybrid": "Hybrid (HTTP ping + UniFi data)",
+                    "unifi_primary": "UniFi Primary (fallback to HTTP)",
+                    "unifi_only": "UniFi Only (no HTTP ping)",
+                    "http_only": "HTTP Only (ignore UniFi)"
+                ],
+                required: false,
+                defaultValue: "hybrid"
+            )
+            input (
+                type: "number",
+                name: "pollingIntervalPresent",
+                title: "Polling When Present (seconds)",
+                description: "How often to check when device is present (0 = use device type default)",
+                required: false,
+                defaultValue: 0
+            )
+            input (
+                type: "number",
+                name: "pollingIntervalAway", 
+                title: "Polling When Away (seconds)",
+                description: "How often to check when device is away (0 = use device type default)",
+                required: false,
+                defaultValue: 0
+            )
+            input (
+                type: "number",
+                name: "maxFailedPolls",
+                title: "Max Failed Polls Before Away",
+                description: "Number of failed polls before marking as away (0 = use device type default)",
+                required: false,
+                defaultValue: 0
+            )
+            input (
+                type: "number",
+                name: "httpTimeoutSeconds",
+                title: "HTTP Timeout (seconds)",
+                description: "Timeout for network requests",
+                required: true,
+                defaultValue: 8
+            )
+            input (
+                type: "number",
+                name: "unifiTimeoutSeconds",
+                title: "UniFi Timeout (seconds)",
+                description: "Timeout for UniFi API requests",
+                required: false,
+                defaultValue: 10
+            )
+            input (
+                type: "bool",
+                name: "treatConnectionRefusedAsPresent",
+                title: "Treat 'Connection Refused' as Present?",
+                description: "If enabled, connection refused = device is present but not responding to HTTP",
+                required: true,
+                defaultValue: true
+            )
+        }
+        section("Logging & Control") {
+            input (
+                type: "bool",
+                name: "enableDebugLogging",
+                title: "Enable Debug Logging?",
+                required: true,
+                defaultValue: false
+            )
+            input (
+                type: "bool",
+                name: "enableDevice",
+                title: "Enable Device?",
+                required: true,
+                defaultValue: true
+            )
+        }
+    }
+}
+
+def logDebug(msg) {
+    if (settings.enableDebugLogging) {
+        log.debug "${device.displayName}: ${msg}"
+    }
+}
+
+def logInfo(msg) {
+    log.info "${device.displayName}: ${msg}"
+}
+
+def installed() {
+    logInfo "installed()"
+    initializeState()
+    updated()
+}
+
+def updated() {
+    logInfo "updated() - Device type: ${settings.deviceType}, UniFi enabled: ${settings.enableUnifiIntegration}"
+    unschedule()
+    initializeState()
+
+    if (settings.enableDevice) {
+        if (!settings.ipAddress?.trim()) {
+            logInfo "Device enabled but IP Address not set. Disabling polling."
+            return
+        }
+        
+        if (settings.enableUnifiIntegration && !validateUnifiSettings()) {
+            logInfo "UniFi integration enabled but settings incomplete. Will use HTTP-only mode."
+        }
+        
+        showRecommendedSettings()
+        scheduleNext()
+        runIn(3, refresh)
+    } else {
+        logInfo "Device is disabled. Unscheduling all tasks."
+    }
+}
+
+def initializeState() {
+    logDebug "initializeState()"
+    
+    if (state.failedPollCount == null) state.failedPollCount = 0
+    if (state.lastSeenEpoch == null) state.lastSeenEpoch = 0
+    if (state.lastTriedEpoch == null) state.lastTriedEpoch = 0
+    if (state.unifiCookie == null) state.unifiCookie = ""
+    if (state.unifiLastLogin == null) state.unifiLastLogin = 0
+    
+    // Initialize attributes
+    sendEvent(name: "failedPolls", value: state.failedPollCount, displayed: false)
+    sendEvent(name: "deviceType", value: settings.deviceType ?: "other", displayed: false)
+    sendEvent(name: "detectionMethod", value: "Initializing", displayed: false)
+    sendEvent(name: "unifiStatus", value: "Not configured", displayed: false)
+    
+    if (state.lastSeenEpoch > 0) {
+        sendEvent(name: "lastSeen", value: formatEpoch(state.lastSeenEpoch), displayed: false)
+    }
+    if (state.lastTriedEpoch > 0) {
+        sendEvent(name: "lastTried", value: formatEpoch(state.lastTriedEpoch), displayed: false)
+    }
+}
+
+private boolean validateUnifiSettings() {
+    return settings.unifiControllerIP?.trim() && 
+           settings.unifiUsername?.trim() && 
+           settings.unifiPassword?.trim() &&
+           settings.macAddress?.trim()
+}
+
+private String formatEpoch(long epochMillis) {
+    if (epochMillis == null || epochMillis == 0) return "N/A"
+    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss z")
+    return sdf.format(new Date(epochMillis))
+}
+
+private Map getDeviceDefaults() {
+    String deviceType = settings.deviceType ?: "other"
+    
+    switch (deviceType) {
+        case "iphone":
+            return [
+                presentInterval: settings.enableUnifiIntegration ? 60 : 90,
+                awayInterval: settings.enableUnifiIntegration ? 180 : 300,
+                maxFails: settings.enableUnifiIntegration ? 10 : 20,
+                description: "iPhone " + (settings.enableUnifiIntegration ? "(UniFi enhanced)" : "(HTTP only)")
+            ]
+        case "android":
+            return [
+                presentInterval: 60,
+                awayInterval: 180,
+                maxFails: 8,
+                description: "Android"
+            ]
+        case "computer":
+            return [
+                presentInterval: 30,
+                awayInterval: 120,
+                maxFails: 5,
+                description: "Computer"
+            ]
+        default: // "other"
+            return [
+                presentInterval: 60,
+                awayInterval: 180,
+                maxFails: 5,
+                description: "Generic device"
+            ]
+    }
+}
+
+private void showRecommendedSettings() {
+    Map defaults = getDeviceDefaults()
+    Integer presentInterval = settings.pollingIntervalPresent ?: defaults.presentInterval
+    Integer awayInterval = settings.pollingIntervalAway ?: defaults.awayInterval  
+    Integer maxFails = settings.maxFailedPolls ?: defaults.maxFails
+    
+    String timeoutDesc = ""
+    Integer minTimeout = (presentInterval * maxFails) / 60
+    Integer maxTimeout = (awayInterval * maxFails) / 60
+    
+    if (minTimeout == maxTimeout) {
+        timeoutDesc = "${minTimeout} minutes"
+    } else {
+        timeoutDesc = "${minTimeout}-${maxTimeout} minutes"
+    }
+    
+    logInfo "Using ${defaults.description} settings:"
+    logInfo "  - Present: check every ${presentInterval}s"
+    logInfo "  - Away: check every ${awayInterval}s" 
+    logInfo "  - Timeout: ${timeoutDesc} (${maxFails} failed polls)"
+    
+    if (settings.enableUnifiIntegration) {
+        logInfo "  - Detection mode: ${settings.detectionMode ?: 'hybrid'}"
+    }
+}
+
+private void scheduleNext() {
+    boolean isPresent = device.currentValue('presence') == "present"
+    Map defaults = getDeviceDefaults()
+    
+    Integer interval = isPresent ? 
+        (settings.pollingIntervalPresent ?: defaults.presentInterval) :
+        (settings.pollingIntervalAway ?: defaults.awayInterval)
+    
+    Date nextCheck = new Date(new Date().getTime() + (interval * 1000))
+    sendEvent(name: "nextCheckIn", value: formatEpoch(nextCheck.getTime()), displayed: false)
+    
+    logDebug "Scheduling next refresh in ${interval}s (device is ${isPresent ? 'present' : 'away'})"
+    runIn(interval, refresh)
+}
+
+def refresh() {
+    state.lastTriedEpoch = new Date().getTime()
+    sendEvent(name: "lastTried", value: formatEpoch(state.lastTriedEpoch), displayed: false)
+    
+    logDebug "refresh() - Failed polls: ${state.failedPollCount}"
+    
+    if (!settings.enableDevice || !settings.ipAddress?.trim()) {
+        logDebug "Device disabled or IP not set"
+        scheduleNext()
+        return
+    }
+    
+    // Increment failed poll count preemptively
+    state.failedPollCount = (state.failedPollCount ?: 0) + 1
+    sendEvent(name: "failedPolls", value: state.failedPollCount, displayed: false)
+    
+    // Check if we should mark as away
+    Map defaults = getDeviceDefaults()
+    Integer maxFails = settings.maxFailedPolls ?: defaults.maxFails
+    
+    if (state.failedPollCount > maxFails) {
+        if (device.currentValue('presence') != "not present") {
+            String desc = "${device.displayName} is OFFLINE (${state.failedPollCount} failed polls, max ${maxFails})"
+            logInfo desc
+            sendEvent(name: "presence", value: "not present", descriptionText: desc, isStateChange: true)
+        }
+    }
+    
+    // Determine detection strategy
+    String mode = settings.detectionMode ?: "hybrid"
+    boolean useUnifi = settings.enableUnifiIntegration && validateUnifiSettings()
+    
+    if (useUnifi && (mode == "unifi_only" || mode == "unifi_primary")) {
+        // Try UniFi first/only
+        checkUnifiPresence()
+    } else if (mode == "http_only" || !useUnifi) {
+        // HTTP only
+        checkHttpPresence()
+    } else {
+        // Hybrid mode - check both
+        state.pendingChecks = 2
+        state.httpResult = null
+        state.unifiResult = null
+        checkHttpPresence()
+        checkUnifiPresence()
+    }
+}
+
+private void checkHttpPresence() {
+    Integer port = settings.targetPort ?: 80
+    Integer timeout = settings.httpTimeoutSeconds ?: 8
+    
+    try {
+        asynchttpGet("httpCallback", [
+            uri: "http://${settings.ipAddress.trim()}:${port}/",
+            timeout: timeout
+        ])
+        logDebug "HTTP request sent to ${settings.ipAddress}:${port} (timeout: ${timeout}s)"
+    } catch (Exception e) {
+        log.error "Failed to send HTTP request: ${e.message}"
+        processHttpResult(null, "Exception: ${e.message}")
+    }
+}
+
+private void checkUnifiPresence() {
+    if (!validateUnifiSettings()) {
+        processUnifiResult(false, "UniFi settings not configured")
+        return
+    }
+    
+    // Check if we need to login (cookie expired or empty)
+    long now = new Date().getTime()
+    boolean needLogin = !state.unifiCookie || (now - state.unifiLastLogin) > 3600000 // 1 hour
+    
+    if (needLogin) {
+        loginToUnifi()
+    } else {
+        queryUnifiClient()
+    }
+}
+
+private void loginToUnifi() {
+    String controllerType = settings.unifiControllerType ?: "udm"
+    String port = settings.unifiControllerPort ?: "443" // Your log shows 38193 is used
+    String controllerUrl = "https://${settings.unifiControllerIP}:${port}"
+    
+    String loginEndpoint
+    switch (controllerType) {
+        case "udm":
+            loginEndpoint = "/api/auth/login"
+            break
+        case "cloudkey":
+            loginEndpoint = "/api/auth/login"
+            break
+        case "selfhosted":
+        default:
+            loginEndpoint = "/api/login" // This matches your log
+            break
+    }
+    
+    Map loginData = [
+        username: settings.unifiUsername,
+        password: settings.unifiPassword
+    ]
+    
+    if (controllerType == "selfhosted") {
+        loginData.remember = false // This seems correct for older self-hosted
+    }
+    
+    logDebug "Attempting UniFi login to ${controllerUrl}${loginEndpoint} (${controllerType})"
+    
+    Map params = [
+        uri: "${controllerUrl}${loginEndpoint}",
+        // Use requestContentType and pass the map directly for the body
+        requestContentType: "application/json", 
+        body: loginData, // Pass the Groovy map, Hubitat will convert to JSON
+        headers: [ // You can still set other headers like Accept
+            "Accept": "application/json"
+        ],
+        timeout: settings.unifiTimeoutSeconds ?: 10,
+        ignoreSSLIssues: true // Keep this, especially for self-signed certs
+    ]
+    
+    try {
+        asynchttpPost("unifiLoginCallback", params)
+        logDebug "UniFi login request sent"
+    } catch (Exception e) {
+        log.error "Failed to send UniFi login request: ${e.message}"
+        processUnifiResult(false, "Login failed: ${e.message}")
+    }
+}
+
+def unifiLoginCallback(response, data) {
+    logDebug "UniFi login response - Status: ${response?.status}"
+    
+    if (response?.hasError() || (response?.status != 200 && response?.status != 201)) {
+        String error = response?.errorMessage ?: "Login failed with status ${response?.status}"
+        log.error "UniFi login failed: ${error}"
+        
+        // Provide more specific error help
+        if (response?.status == 408) {
+            error = "Timeout - check IP address and port number"
+        } else if (response?.status == 401) {
+            error = "Authentication failed - check username/password"
+        } else if (response?.status == 404) {
+            error = "API endpoint not found - check controller type setting"
+        }
+        
+        processUnifiResult(false, "Login failed: ${error}")
+        return
+    }
+    
+    // Extract cookie from response - try multiple cookie formats
+    String setCookieHeader = response.headers?."Set-Cookie"
+    String cookieValue = ""
+    
+    if (setCookieHeader) {
+        // Try different cookie patterns for different controller types
+        def patterns = [
+            /TOKEN=([^;]+)/,           // UDM/UDM Pro
+            /unifises=([^;]+)/,        // Older controllers
+            /csrf_token=([^;]+)/       // Some setups
+        ]
+        
+        for (pattern in patterns) {
+            def matcher = setCookieHeader =~ pattern
+            if (matcher) {
+                String cookieName = pattern.toString().contains("TOKEN") ? "TOKEN" : 
+                                  pattern.toString().contains("unifises") ? "unifises" : "csrf_token"
+                cookieValue = "${cookieName}=${matcher[0][1]}"
+                break
+            }
+        }
+    }
+    
+    // Also try to extract from response body for newer controllers
+    if (!cookieValue && response.data) {
+        try {
+            def jsonSlurper = new JsonSlurper()
+            def responseData = jsonSlurper.parseText(response.data)
+            if (responseData?.token) {
+                cookieValue = "TOKEN=${responseData.token}"
+            }
+        } catch (Exception e) {
+            logDebug "Could not parse login response body: ${e.message}"
+        }
+    }
+    
+    if (cookieValue) {
+        state.unifiCookie = cookieValue
+        state.unifiLastLogin = new Date().getTime()
+        logDebug "UniFi login successful, cookie saved: ${cookieValue.take(20)}..."
+        queryUnifiClient()
+    } else {
+        log.error "UniFi login failed: No valid session cookie received"
+        logDebug "Response headers: ${response.headers}"
+        logDebug "Response body: ${response.data?.take(200)}"
+        processUnifiResult(false, "Login failed: No session cookie")
+    }
+}
+
+private void queryUnifiClient() {
+    String controllerType = settings.unifiControllerType ?: "udm"
+    String port = settings.unifiControllerPort ?: "443"
+    String controllerUrl = "https://${settings.unifiControllerIP}:${port}"
+    String siteName = settings.unifiSite ?: "default"
+    String macAddress = settings.macAddress.toLowerCase().replace(":", "")
+    
+    // Different API endpoints for different controller types
+    String clientEndpoint
+    switch (controllerType) {
+        case "udm":
+            clientEndpoint = "/proxy/network/api/s/${siteName}/stat/sta"
+            break
+        case "cloudkey":
+            clientEndpoint = "/api/s/${siteName}/stat/sta"
+            break
+        case "selfhosted":
+        default:
+            clientEndpoint = "/api/s/${siteName}/stat/sta"
+            break
+    }
+    
+    logDebug "Querying UniFi clients at ${controllerUrl}${clientEndpoint}"
+    
+    Map params = [
+        uri: "${controllerUrl}${clientEndpoint}",
+        headers: [
+            "Cookie": state.unifiCookie,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        ],
+        timeout: settings.unifiTimeoutSeconds ?: 10,
+        ignoreSSLIssues: true
+    ]
+    
+    try {
+        asynchttpGet("unifiClientCallback", params)
+        logDebug "UniFi client query sent for MAC: ${settings.macAddress}"
+    } catch (Exception e) {
+        log.error "Failed to query UniFi clients: ${e.message}"
+        processUnifiResult(false, "Query failed: ${e.message}")
+    }
+}
+
+def unifiClientCallback(response, data) {
+    logDebug "UniFi client response - Status: ${response?.status}"
+
+    if (response?.hasError()) {
+        if (response?.status == 401) {
+            logDebug "UniFi session expired, attempting re-login"
+            state.unifiCookie = ""
+            loginToUnifi()
+            return
+        } else {
+            String error = response?.errorMessage ?: "Query failed"
+            log.error "UniFi client query failed: ${error}"
+            processUnifiResult(false, "Query failed: ${error}")
+            return
+        }
+    }
+
+    if (response?.status != 200) {
+        log.error "UniFi client query failed with status: ${response?.status}"
+        processUnifiResult(false, "Query failed: HTTP ${response?.status}")
+        return
+    }
+
+    try {
+        def jsonSlurper = new JsonSlurper()
+        def responseData = jsonSlurper.parseText(response.data)
+
+        if (responseData?.data) {
+            String targetMac = settings.macAddress.toLowerCase().replace(":", "")
+
+            def ourDevice = responseData.data.find { client ->
+                client.mac?.toLowerCase()?.replace(":", "") == targetMac
+            }
+
+            if (ourDevice) {
+                // Extract values, providing defaults if null to avoid errors
+                Long lastSeenEpochSeconds = ourDevice.last_seen instanceof Number ? ourDevice.last_seen : 0
+                Long uptimeSeconds = ourDevice.uptime instanceof Number ? ourDevice.uptime : 0
+                String clientIp = ourDevice.ip ?: "N/A"
+                String clientName = ourDevice.name ?: ourDevice.hostname ?: "Unknown"
+                String clientApMac = ourDevice.ap_mac ?: "N/A"
+                String clientEssid = ourDevice.essid ?: "N/A"
+
+                // Convert last_seen to milliseconds for comparison and formatting
+                Long lastSeenEpochMillis = lastSeenEpochSeconds * 1000
+                Long nowMillis = new Date().getTime()
+                Long fiveMinutesInMillis = 5 * 60 * 1000 // 300000
+
+                boolean recentlySeen = (lastSeenEpochSeconds > 0) && ((nowMillis - lastSeenEpochMillis) < fiveMinutesInMillis)
+                boolean hasSufficientUptime = (uptimeSeconds > 10) // e.g., connected for more than 10 seconds
+
+                boolean isConnected = recentlySeen || (hasSufficientUptime && clientIp != "N/A") // Be more confident if uptime is used
+
+                String lastSeenStr = lastSeenEpochSeconds > 0 ? formatEpoch(lastSeenEpochMillis) : "Never or Invalid"
+                String uptimeStr = uptimeSeconds > 0 ? "${uptimeSeconds}s" : "N/A or 0"
+                String reasonForPresence = ""
+                if (isConnected) {
+                    if (recentlySeen) reasonForPresence = "Recently seen (${lastSeenStr})"
+                    if (hasSufficientUptime && clientIp != "N/A") {
+                        if (reasonForPresence) reasonForPresence += " AND "
+                        reasonForPresence += "Has uptime (${uptimeStr}) and IP (${clientIp})"
+                    }
+                } else {
+                     reasonForPresence = "Not recently seen (Last: ${lastSeenStr}) AND No sufficient uptime/IP (Uptime: ${uptimeStr}, IP: ${clientIp})"
+                }
+
+
+                sendEvent(name: "unifiLastSeen", value: lastSeenStr, displayed: false)
+
+                logDebug "UniFi Device Details - MAC: ${targetMac}, IP: ${clientIp}, Name: ${clientName}, Last_Seen_API: ${ourDevice.last_seen}, Uptime_API: ${ourDevice.uptime}"
+                logDebug "UniFi Parsed - LastSeenEpochSec: ${lastSeenEpochSeconds}, UptimeSec: ${uptimeSeconds}, LastSeenFormatted: ${lastSeenStr}"
+                logDebug "UniFi Logic - NowMillis: ${nowMillis}, LastSeenMillis: ${lastSeenEpochMillis}, Diff: ${nowMillis - lastSeenEpochMillis}, 5MinMillis: ${fiveMinutesInMillis}"
+                logDebug "UniFi Result - RecentlySeen: ${recentlySeen}, HasSufficientUptime: ${hasSufficientUptime}, IsConnected: ${isConnected}, Reason: ${reasonForPresence}"
+
+                processUnifiResult(isConnected, reasonForPresence)
+
+            } else {
+                logDebug "Device MAC ${targetMac} not found in UniFi client list."
+                processUnifiResult(false, "Not found in client list")
+            }
+        } else {
+            log.error "UniFi response missing data field"
+            logDebug "Response Data: ${response.data?.take(500)}" // Log part of the data if 'data' field is missing
+            processUnifiResult(false, "Invalid response format (missing data field)")
+        }
+    } catch (Exception e) {
+        log.error "Failed to parse UniFi response or process client data: ${e.message}"
+        logDebug "Exception trace: ${e.getStackTrace().join('\n')}"
+        processUnifiResult(false, "Parse error: ${e.message}")
+    }
+}
+def httpCallback(response, data) {
+    logDebug "HTTP response - Status: ${response?.status}, Error: ${response?.errorMessage}"
+    
+    boolean isPresent = false
+    String reason = ""
+    
+    if (response == null) {
+        reason = "No response (timeout/unreachable)"
+    } else if (response.hasError()) {
+        String errorMsg = response.errorMessage ?: "Unknown error"
+        boolean treatRefusedAsPresent = settings.treatConnectionRefusedAsPresent != false
+        
+        if (treatRefusedAsPresent && errorMsg.toLowerCase().contains("connection refused")) {
+            isPresent = true
+            reason = "Connection refused (device active)"
+        } else {
+            reason = "Error: ${errorMsg}"
+        }
+    } else if (response.status >= 200 && response.status < 500) {
+        isPresent = true
+        reason = "HTTP ${response.status}"
+    } else {
+        reason = "HTTP ${response.status} (unexpected)"
+    }
+    
+    processHttpResult(isPresent, reason)
+}
+
+private void processHttpResult(Boolean present, String reason) {
+    logDebug "HTTP result: ${present}, reason: ${reason}"
+    
+    String mode = settings.detectionMode ?: "hybrid"
+    
+    if (mode == "hybrid") {
+        state.httpResult = [present: present, reason: reason]
+        checkIfBothResultsReady()
+    } else {
+        // HTTP-only mode
+        sendEvent(name: "detectionMethod", value: "HTTP only", displayed: false)
+        sendEvent(name: "unifiStatus", value: "Not used", displayed: false)
+        processPresenceResult(present, reason)
+    }
+}
+
+private void processUnifiResult(Boolean present, String reason) {
+    logDebug "UniFi result: ${present}, reason: ${reason}"
+    sendEvent(name: "unifiStatus", value: reason, displayed: false)
+    
+    String mode = settings.detectionMode ?: "hybrid"
+    
+    if (mode == "hybrid") {
+        state.unifiResult = [present: present, reason: reason]
+        checkIfBothResultsReady()
+    } else if (mode == "unifi_only") {
+        sendEvent(name: "detectionMethod", value: "UniFi only", displayed: false)
+        processPresenceResult(present, reason)
+    } else if (mode == "unifi_primary") {
+        if (present) {
+            sendEvent(name: "detectionMethod", value: "UniFi primary", displayed: false)
+            processPresenceResult(present, reason)
+        } else {
+            // UniFi didn't find device, fallback to HTTP
+            logDebug "UniFi primary mode: device not found via UniFi, falling back to HTTP"
+            checkHttpPresence()
+        }
+    }
+}
+
+private void checkIfBothResultsReady() {
+    if (state.httpResult != null && state.unifiResult != null) {
+        // Both results available - combine them
+        boolean httpPresent = state.httpResult.present ?: false
+        boolean unifiPresent = state.unifiResult.present ?: false
+        boolean combinedPresent = httpPresent || unifiPresent
+        
+        String combinedReason = "HTTP: ${state.httpResult.reason}, UniFi: ${state.unifiResult.reason}"
+        
+        sendEvent(name: "detectionMethod", value: "Hybrid (HTTP + UniFi)", displayed: false)
+        processPresenceResult(combinedPresent, combinedReason)
+        
+        // Clear results for next time
+        state.httpResult = null
+        state.unifiResult = null
+    }
+}
+
+private void processPresenceResult(boolean isPresent, String reason) {
+    if (isPresent) {
+        // Device found - reset counters and update presence
+        state.lastSeenEpoch = new Date().getTime()
+        sendEvent(name: "lastSeen", value: formatEpoch(state.lastSeenEpoch), displayed: false)
+        
+        boolean wasPresent = device.currentValue('presence') == "present"
+        if (state.failedPollCount > 0 || !wasPresent) {
+            String desc = "${device.displayName} is ONLINE (${reason})"
+            logInfo desc
+            sendEvent(name: "presence", value: "present", descriptionText: desc, isStateChange: !wasPresent)
+        }
+        
+        state.failedPollCount = 0
+        sendEvent(name: "failedPolls", value: 0, displayed: false)
+        logDebug "Device confirmed present - reset failed poll count"
+        
+    } else {
+        logDebug "Device not detected: ${reason} (Failed polls: ${state.failedPollCount})"
+    }
+    
+    scheduleNext()
+}
+
+void refreshDevice() {
+    logInfo "Manual refresh requested"
+    refresh()
+}
